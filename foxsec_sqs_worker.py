@@ -65,6 +65,7 @@ def retry(retry_count=5, delay=5, allowed_exceptions=()):
         return wrapper
     return decorator
 
+
 @retry(retry_count=5, delay=5)
 def waf_update_ip_set(waf_ipset_id, waf_updates):
     """Update WAF ip set"""
@@ -153,7 +154,7 @@ def lambda_handler(event, context):
     for record in event.get('Records'):
         # Mark SQS message for deletion early
         sqs_entry = {
-            'Id': record.get('messageId'), 
+            'Id': record.get('messageId'),
             'ReceiptHandle': record.get('receiptHandle')
         }
         sqs_entries.append(sqs_entry)
