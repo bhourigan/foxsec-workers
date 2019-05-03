@@ -1,4 +1,4 @@
-"""FoxSec Dynamo worker"""
+"""FoxSec WAF dynamo worker"""
 import datetime
 import functools
 import time
@@ -10,7 +10,6 @@ import json
 from pprint import pprint
 from botocore.exceptions import ClientError
 import boto3
-import requests
 
 
 # Globals
@@ -18,7 +17,7 @@ LOGGER = None
 DYNAMODB = None
 WAFREGIONAL = None
 SECRETSMANAGER = None
-
+SQS = None
 
 def init() -> None:
     """Initialize global variables"""
@@ -36,20 +35,28 @@ def init() -> None:
         LOGGER.error('dynamodb resource failed to initialize: %s', err)
         sys.exit(1)
 
-    # Initialize boto3 wafregional resource
+    # Initialize boto3 wafregional client
     global WAFREGIONAL  # pylint: disable-msg=W0603
     try:
         WAFREGIONAL = boto3.client('waf-regional')
     except Exception as err:
-        LOGGER.error('wafregional resource failed to initialize: %s', err)
+        LOGGER.error('wafregional client failed to initialize: %s', err)
         sys.exit(1)
 
-    # Initialize boto3 secretsmanager resource
+    # Initialize boto3 secretsmanager client
     global SECRETSMANAGER  # pylint: disable-msg=W0603
     try:
         SECRETSMANAGER = boto3.client('secretsmanager')
     except Exception as err:
-        LOGGER.error('secretsmanager resource failed to initialize: %s', err)
+        LOGGER.error('secretsmanager client failed to initialize: %s', err)
+        sys.exit(1)
+
+    # Initialize boto3 sqs resource
+    global SQS  # pylint: disable-msg=W0603
+    try:
+        SQS = boto3.resource('sqs')
+    except Exception as err:
+        LOGGER.error('sqs resource failed to initialize: %s', err)
         sys.exit(1)
 
 
@@ -58,9 +65,9 @@ def configure() -> dict:
 
     try:
         secrets = SECRETSMANAGER.get_secret_value(
-            SecretId='foxsec/dynamo_worker')
+            SecretId='foxsec/waf_dynamo_worker')
     except Exception as err:
-        LOGGER.error('unable to get foxsec/dynamo_worker from secrets manager: %s', err)
+        LOGGER.error('unable to get foxsec/waf_dynamo_worker from secrets manager: %s', err)
         sys.exit(1)
 
     # Extract the JSON encoded secrets string
@@ -103,7 +110,7 @@ def ip_address_validate(address: str) -> [str, str]:
     try:
         ip_network = ipaddress.ip_network(address)
     except ValueError as err:
-        print('ip_network failed: %s' % err)
+        LOGGER.error('ip_network failed: %s', err)
         return err
     else:
         return str(ip_network), ip_types[ip_network.version]
@@ -135,17 +142,15 @@ def waf_update_ip_set(waf_ipset_id: str, waf_updates: dict) -> bool:
     try:
         change_token = WAFREGIONAL.get_change_token()
     except ClientError as err:
-        print('waf get_change_token failed: %s' % err)
+        LOGGER.error('waf get_change_token failed: %s', err)
         return False
 
     # ChangeTokenStatus, ResponseMetadata.RetryAttempts
     try:
         token_status = WAFREGIONAL.get_change_token_status(
             ChangeToken=change_token['ChangeToken'])
-        print('TOKEN %s' % change_token['ChangeToken'])
-        pprint(token_status)
     except ClientError as err:
-        print('waf get_change_token_status failed: %s' % err)
+        LOGGER.error('waf get_change_token_status failed: %s', err)
         return False
 
     # Update our WAF ipset and return if successful
@@ -154,7 +159,7 @@ def waf_update_ip_set(waf_ipset_id: str, waf_updates: dict) -> bool:
                                   ChangeToken=change_token['ChangeToken'],
                                   Updates=waf_updates)
     except ClientError as err:
-        print('waf update_ip_set failed: %s' % err)
+        LOGGER.error('waf update_ip_set failed: %s', err)
         return False
 
     return True
@@ -170,7 +175,7 @@ def dynamodb_delete_items(items: dict) -> None:
         try:
             DYNAMODB.delete_item(Key={'id': item})
         except ClientError as err:
-            print('dynamodb delete_item failed: %s' % err)
+            LOGGER.error('dynamodb delete_item failed: %s', err)
 
 
 def slack_log_expiration(source_address: str, expires_at: str, blocked_at: str,
@@ -207,7 +212,7 @@ def slack_log_expiration(source_address: str, expires_at: str, blocked_at: str,
                 'text': 'View logs',
                 'url': "https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logs-insights:queryDetail=~(end~0~start~-3600~timeType~'RELATIVE~unit~'seconds~editorString~'fields*20*40message*20*7c*20filter*20*40message*20like*20*2f{}*2f*0a*7c*20sort*20*40timestamp*20desc*0a*7c*20limit*202000~isLiveTail~false~queryId~'webserver-prod*2fapache_access~source~'webserver-prod*2fapache_access)".format(escaped_search_pattern)
             }],
-            'footer': 'foxsec_dynamo_worker'
+            'footer': 'foxsec_waf_dynamo_worker'
         }]
     }
 
@@ -238,25 +243,45 @@ def slack_log_untracked(source_address: str, slack_messages: dict) -> None:
     slack_messages.append(slack_data)
 
 
-def post_slack_messages(slack_webhook_url: str, slack_messages: dict) -> None:
+def slack_sqs_send_messages(slack_queue_name:str, slack_messages: dict) -> None:
     """
-    Post a message to Slack
+    Send Slack messages to a SQS queue for consumption by our Slack SQS
+    worker
     """
 
-    for slack_data in slack_messages:
-        # Post the message to webhook
-        response = requests.post(slack_webhook_url,
-                                 json=slack_data,
-                                 headers={'Content-Type': 'application/json'})
+    # Look up our SQS queue by name
+    try:
+        queue = SQS.get_queue_by_name(QueueName=slack_queue_name)
+    except Exception as err:
+        LOGGER.error('sqs get_queue_by_name failed: %s', err)
+        sys.exit(1)
 
-        # Slack docs say 1 message/s
-        time.sleep(1)
 
-        if response.status_code != 200:
-            raise ValueError(
-                'Request to slack returned an error %s, the response is:\n%s'
-                % (response.status_code, response.text)
-            )
+    # Initialize local variables
+    sqs_message_id = 0
+    sqs_entries = []
+
+    # Run through slack_messages and post after we've got 10 messages queued
+    # up
+    for slack_message in slack_messages:
+        sqs_entry = {
+            'Id': str(sqs_message_id),
+            'MessageBody': json.dumps(slack_message)
+        }
+
+        sqs_entries.append(sqs_entry)
+        sqs_message_id += 1
+
+        if sqs_message_id >= 10:
+            try:
+                response = queue.send_messages(Entries=sqs_entries)
+            except Exception as err:
+                LOGGER.error('sqs send_message failed: %s', err)
+                sys.exit(1)
+
+            # Empty local variables
+            sqs_message_id = 0
+            sqs_entries = []
 
 
 def main() -> bool:
@@ -298,17 +323,13 @@ def main() -> bool:
                                                 '%Y-%m-%d %H:%M:%S.%f')
 
         if expires_at < current_time:
-            # Limit how many Slack-notified rules we evaluate per run
-            if slack_notifications >= 150:
-                break
-
             # Limit how many DynamoDB items we need to delete per run
             if dynamodb_expired_addresses >= 500:
                 break
 
             # Console log
-            print('[Dynamo] Marking item %s, address %s for removal (expired %s)'
-                  % (item.get('id'), source_address, expires_at))
+            LOGGER.debug('[Dynamo] Marking item %s, address %s for removal (expired %s)',
+                  item.get('id'), source_address, expires_at)
 
             # Mark for deletion in DynamoDB
             dynamodb_pending_delete.append(item.get('id'))
@@ -332,10 +353,6 @@ def main() -> bool:
     # Iteriate through WAF ipset
     items = dynamodb_items.get('Items')
     for ip in ip_networks:  # pylint: disable-msg=C0103
-        # Limit how many Slack-notified rules we evaluate per run
-        if slack_notifications >= 150:
-            break
-
         # Limit how many WAF updates per run
         if waf_rogue_addresses >= 150:
             break
@@ -343,7 +360,7 @@ def main() -> bool:
         source_address, source_type = ip_address_validate(ip)
         if not list(filter(lambda item: item.get('address') == source_address, items)):
             # Console log
-            print('[waf] Rogue ipset address %s marked for removal' %
+            LOGGER.debug('[waf] Rogue ipset address %s marked for removal',
                   source_address)
 
             # Slack log
@@ -356,21 +373,25 @@ def main() -> bool:
             waf_rogue_addresses += 1
 
     # Execute Dynamo updates
-    if dynamodb_pending_delete:
-        dynamodb_delete_items(dynamodb_pending_delete)
+#    if dynamodb_pending_delete:
+#        dynamodb_delete_items(dynamodb_pending_delete)
 
     # Execute WAF updates
-    if waf_updates:
-        if not waf_update_ip_set(config['ipset_id'], waf_updates):
-            print('waf_update_ip_set failed')
-            return False
+#    if waf_updates:
+#        if not waf_update_ip_set(config['ipset_id'], waf_updates):
+#            LOGGER.error('waf_update_ip_set failed')
+#            return False
 
     # Post to Slack
-    post_slack_messages(slack_webhook_url=config['slack_webhook_url'],
-                        slack_messages=slack_messages)
+    if slack_notifications > 0:
+        slack_sqs_send_messages(slack_queue_name=config['slack_queue_name'],
+                                slack_messages=slack_messages)
 
-    print('Removed %d expired ipset entries, %d rogue WAF entries, and sent %d slack notifications'
-          % (dynamodb_expired_addresses, waf_rogue_addresses, slack_notifications))
+    # Log summary
+    LOGGER.info('Removed %d expired ipset entries, %d rogue WAF entries, and queued %d slack notifications',
+                dynamodb_expired_addresses, waf_rogue_addresses, slack_notifications)
+    print('Removed %d expired ipset entries, %d rogue WAF entries, and queued %d slack notifications' %
+                (dynamodb_expired_addresses, waf_rogue_addresses, slack_notifications))
     return True
 
 
