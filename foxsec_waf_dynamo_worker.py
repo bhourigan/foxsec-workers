@@ -324,7 +324,7 @@ def main() -> bool:
 
         if expires_at < current_time:
             # Limit how many DynamoDB items we need to delete per run
-            if dynamodb_expired_addresses >= 500:
+            if dynamodb_expired_addresses >= 1000:
                 break
 
             # Console log

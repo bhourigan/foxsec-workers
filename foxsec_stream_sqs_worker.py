@@ -42,61 +42,6 @@ def parse_arn(arn):
     return result
 
 
-def retry(retry_count=5, delay=5, allowed_exceptions=()):
-    """Decorator that allows function retries"""
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            for _ in range(retry_count):
-                try:
-                    result = func(*args, **kwargs)
-                    if result:
-                        return result
-                except allowed_exceptions as current_exception:
-                    last_exception = current_exception
-                # Instead of printing, consider using python logging module
-                print("%s: Waiting for %s seconds before retrying again"
-                      % (datetime.datetime.utcnow(), delay))
-                time.sleep(delay)
-
-            if last_exception is not None:
-                raise type(last_exception) from last_exception
-            return result
-        return wrapper
-    return decorator
-
-
-@retry(retry_count=5, delay=5)
-def waf_update_ip_set(waf_ipset_id, waf_updates):
-    """Update WAF ip set"""
-    # Get our change token
-    try:
-        change_token = WAFREGIONAL.get_change_token()  # print(token['ChangeToken'])
-    except ClientError as err:
-        print("waf get_change_token failed: %s" % err)
-        return False
-
-    # ChangeTokenStatus, ResponseMetadata.RetryAttempts
-    try:
-        token_status = WAFREGIONAL.get_change_token_status(ChangeToken=change_token['ChangeToken'])
-        print("TOKEN %s" % change_token['ChangeToken'])
-        pprint(token_status)
-    except ClientError as err:
-        print("waf get_change_token_status failed: %s" % err)
-        return False
-
-    # Update our WAF ipset and return if successful
-    try:
-        WAFREGIONAL.update_ip_set(IPSetId=waf_ipset_id,
-                                  ChangeToken=change_token['ChangeToken'],
-                                  Updates=waf_updates)
-    except ClientError as err:
-        print("waf update_ip_set failed: %s" % err)
-        return False
-    else:
-        return True
-
-
 def sqs_delete_messages(arn, messages):
     """Delete messages from SQS arn"""
     # Parse SQS ARN
@@ -115,30 +60,8 @@ def sqs_delete_messages(arn, messages):
     except ClientError as err:
         print("sqs delete_message_batch failed: %s" % err)
         return False
-    else:
-        return True
 
-
-def ip_address_validate(address):
-    """Confirm valid IP and identify v4/v6"""
-    ip_types = {4: 'IPV4', 6: 'IPV6'}
-
-    try:
-        ip_network = ipaddress.ip_network(address)
-    except ValueError as err:
-        print("ip_network failed: %s" % err)
-        return err
-    else:
-        return str(ip_network), ip_types[ip_network.version]
-
-
-def dynamodb_put_items(items):
-    """Put items in DynamoDB. One item at a time."""
-    for item in items:
-        try:
-            DYNAMODB.put_item(Item=item)
-        except ClientError as err:
-            print("dybamodb put item failed: %s" % err)
+    return True
 
 
 def lambda_handler(event, context):
